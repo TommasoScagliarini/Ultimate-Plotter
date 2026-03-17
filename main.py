@@ -37,7 +37,7 @@ from plotters import (
 # ══════════════════════════════════════════════════════════════════════════════
 
 # ── Directory base dei file SEA (protesi) ─────────────────────────────────────
-BASE_SEA = r"C:\Users\tomma\Desktop\Opensim OMNIBUS\21_76-WellScaled-SEA\CMC\Risultati_SEASEA"
+BASE_SEA = r"C:\Users\tomma\Desktop\Opensim OMNIBUS\21_76-WellScaled-SEA\CMC\Risultati_SEASEA-impedence"
 
 # ── File SEA ─────────────────────────────────────────────────────────────────
 FILES_SEA = {
