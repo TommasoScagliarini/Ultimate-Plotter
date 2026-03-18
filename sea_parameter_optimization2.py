@@ -1,14 +1,20 @@
 """
 SEA Parameter Optimization for CMC Simulation
 ==============================================
-Phase 1: Coarse grid search (parallel) con barra di avanzamento
-Phase 2: Differential evolution refinement (parallel) con contatore live
+Phase 1: Coarse grid search (parallel)
+Phase 2: Differential evolution refinement (parallel)
 Phase 3: Results analysis and export
 
 NOTE: CMC non gestisce spazi nei path letti dall'XML.
       Tutti i file temporanei vengono copiati in WORK_DIR (senza spazi).
-      Su Windows, differential_evolution con workers=N usa spawn: il
-      support_mapping viene salvato su JSON e ricaricato da ogni worker.
+      I file XML copiati vengono anche "patchati" internamente per
+      risolvere eventuali path con spazi contenuti dentro di essi
+      (es. path GRF dentro Externall_Loads.xml).
+
+      Su Windows, differential_evolution con workers=N usa spawn e i
+      globali Python non vengono ereditati dai processi figli. Il
+      support_mapping viene quindi salvato su disco come JSON e
+      ricaricato da ogni worker della Phase 2.
 """
 
 import os
@@ -22,6 +28,7 @@ import numpy as np
 import itertools
 import time
 import signal
+import threading
 from scipy.optimize import differential_evolution
 
 # ==============================================================================
@@ -37,18 +44,20 @@ CMC_EXE              = r"C:\OpenSim-mCMC\bin\cmc.exe"
 PLUGIN_DLL           = r"C:\OpenSim-mCMC\plugins\SEA_Plugin_BlackBox_mCMC_impedence.dll"
 
 # Directory di lavoro SENZA SPAZI
-WORK_DIR      = r"C:\CMC_Sweep"
-RESULTS_DIR   = os.path.join(WORK_DIR, "sweep_results")
-SUMMARY_CSV   = os.path.join(WORK_DIR, "sweep_summary_global.csv")
-MAPPING_CACHE = os.path.join(WORK_DIR, "_support_mapping.json")
+WORK_DIR       = r"C:\CMC_Sweep"
+RESULTS_DIR    = os.path.join(WORK_DIR, "sweep_results")
+SUMMARY_CSV    = os.path.join(WORK_DIR, "sweep_summary_global.csv")
+MAPPING_CACHE  = os.path.join(WORK_DIR, "_support_mapping.json")  # per Phase 2
 
 TARGET_ACTUATORS = ["SEA_Ankle", "SEA_Knee"]
 
+# Mapping colonne: file simulato -> riferimento sano
 JOINT_COLS_MAP = {
     "pros_ankle_angle": "pros_ankle_angle",
     "pros_knee_angle":  "pros_knee_angle",
 }
 
+# Tag del setup CMC che referenziano file su disco
 SETUP_FILE_TAGS = [
     'coordinates_file',
     'desired_kinematics_file',
@@ -59,10 +68,6 @@ SETUP_FILE_TAGS = [
     'actuator_set_files',
     'control_constraints_file',
 ]
-
-# Contatori condivisi tra processi (usati dal sistema di progress)
-_de_counter    = mp.Value('i', 10000)   # run_id univoci per Phase 2
-_de_eval_count = mp.Value('i', 0)       # numero valutazioni Phase 2
 
 # ==============================================================================
 # 2. COPIA E PATCH DEI FILE DI SUPPORTO IN WORK_DIR
@@ -98,8 +103,7 @@ def copy_support_files_to_workdir():
     """
     Copia in WORK_DIR tutti i file referenziati nel setup CMC e il modello.
     Patcha i path interni degli XML copiati.
-    Salva il mapping su MAPPING_CACHE (JSON) per i worker della Phase 2.
-    Restituisce {path_originale: path_in_workdir}.
+    Restituisce {path_originale: path_in_workdir} e lo salva su MAPPING_CACHE.
     """
     os.makedirs(WORK_DIR, exist_ok=True)
     mapping = {}
@@ -133,17 +137,20 @@ def copy_support_files_to_workdir():
     except Exception as e:
         print(f"  [WARN] copy_support_files_to_workdir: {e}")
 
+    # Copia modello base
     if os.path.exists(MODEL_FILE_BASE):
         dst_model = os.path.join(WORK_DIR, os.path.basename(MODEL_FILE_BASE))
         shutil.copy2(MODEL_FILE_BASE, dst_model)
         mapping[MODEL_FILE_BASE] = dst_model
         print(f"  [COPY] {os.path.basename(MODEL_FILE_BASE)}")
 
+    # Patcha path interni degli XML
     print("  Patching path interni degli XML...")
     for fname in os.listdir(WORK_DIR):
         if fname.lower().endswith('.xml'):
             _patch_xml_internal_paths(os.path.join(WORK_DIR, fname))
 
+    # Salva mapping su disco per la Phase 2 (spawn su Windows)
     with open(MAPPING_CACHE, 'w') as f:
         json.dump(mapping, f, indent=2)
 
@@ -151,7 +158,7 @@ def copy_support_files_to_workdir():
 
 
 def load_mapping():
-    """Carica il support_mapping da MAPPING_CACHE."""
+    """Carica il support_mapping da MAPPING_CACHE (usato dai worker Phase 2)."""
     with open(MAPPING_CACHE, 'r') as f:
         return json.load(f)
 
@@ -337,7 +344,6 @@ def _format_time(seconds):
 
 
 def _print_bar(completed, total, elapsed_times, phase_label):
-    """Barra di avanzamento per Phase 1 (totale noto)."""
     pct    = completed / total if total > 0 else 0
     filled = int(pct * 35)
     bar    = '#' * filled + '-' * (35 - filled)
@@ -351,15 +357,6 @@ def _print_bar(completed, total, elapsed_times, phase_label):
         avg_str = '--'
     print(f"\r  {phase_label}  [{bar}]  {completed}/{total}  "
           f"({pct*100:.0f}%)  media/run: {avg_str}  ETA: {eta_str}   ",
-          end='', flush=True)
-
-
-def _print_de_progress(n, est_total, elapsed, kp_ankle, kd_ankle, kp_knee, kd_knee):
-    """Contatore live per Phase 2 (totale stimato)."""
-    pct = min(n / est_total * 100, 99.9)
-    print(f"\r  Phase 2  [eval {n:3d}/~{est_total}]  ({pct:.0f}%)  "
-          f"ultima: {elapsed:.1f}s  "
-          f"KpA={kp_ankle} KdA={kd_ankle} KpK={kp_knee} KdK={kd_knee}   ",
           end='', flush=True)
 
 
@@ -385,7 +382,7 @@ def run_cmc_worker(params):
                 if f.endswith('_controls.sto')] \
                if os.path.isdir(run_dir) else []
     if existing:
-        cost    = evaluate_run_cost(run_dir)
+        cost = evaluate_run_cost(run_dir)
         elapsed = time.time() - t0
         print(f"\n  [SKIP] {run_name} -> costo: {cost:.4f}")
         return (kp_ankle, kd_ankle, kp_knee, kd_knee, cost, elapsed)
@@ -480,11 +477,14 @@ def phase1_grid_search(num_cores, support_mapping):
 # 9. PHASE 2 — DIFFERENTIAL EVOLUTION (raffinamento)
 # ==============================================================================
 
+_de_counter = mp.Value('i', 10000)
+
+
 def _de_cost_wrapper(x):
     """
     Wrapper per differential_evolution.
-    Carica il mapping da JSON (necessario con spawn su Windows).
-    Aggiorna il contatore condiviso e stampa il progress live.
+    Carica il mapping da file JSON — necessario su Windows con spawn,
+    dove i globali Python non vengono ereditati dai processi figli.
     """
     kp_ankle = int(round(x[0]))
     kd_ankle = int(round(x[1]))
@@ -495,30 +495,16 @@ def _de_cost_wrapper(x):
         _de_counter.value += 1
         run_id = _de_counter.value
 
-    t0 = time.time()
+    # Carica il mapping da disco invece di usare un globale
     support_mapping = load_mapping()
-    result  = run_cmc_worker(
+
+    result = run_cmc_worker(
         (kp_ankle, kd_ankle, kp_knee, kd_knee, run_id, support_mapping)
     )
-    elapsed = time.time() - t0
-
-    with _de_eval_count.get_lock():
-        _de_eval_count.value += 1
-        n = _de_eval_count.value
-
-    # Stima totale: prima gen = popsize*n_params, poi popsize per iterazione
-    # popsize=4, n_params=4, maxiter=5 → 4*4 + 4*4*(5-1) = 16 + 64 = 80
-    est_total = 4 * 4 * 5
-    _print_de_progress(n, est_total, elapsed, kp_ankle, kd_ankle, kp_knee, kd_knee)
-
-    return result[4]   # cost
+    return result[4]   # cost è il quinto elemento
 
 
 def phase2_differential_evolution(best_from_phase1, num_cores):
-    # Reset contatore valutazioni
-    with _de_eval_count.get_lock():
-        _de_eval_count.value = 0
-
     print("\n" + "="*60)
     print("PHASE 2 — Differential Evolution (raffinamento)")
     print("="*60)
@@ -543,11 +529,11 @@ def phase2_differential_evolution(best_from_phase1, num_cores):
         print(f"  {lb}: [{b[0]:.0f}, {b[1]:.0f}]")
     print()
 
-    t_start = time.time()
-
     result = differential_evolution(
         _de_cost_wrapper,
         bounds,
+        #maxiter=15,
+        #popsize=6,
         maxiter=5,
         popsize=4,
         tol=1e-4,
@@ -558,9 +544,6 @@ def phase2_differential_evolution(best_from_phase1, num_cores):
         polish=False,
         disp=True,
     )
-
-    print()   # newline dopo l'ultima riga \r del progress
-    print(f"  Completato in {_format_time(time.time() - t_start)}\n")
 
     best_x = result.x
     return {
@@ -578,8 +561,9 @@ def phase2_differential_evolution(best_from_phase1, num_cores):
 
 def save_and_print_results(all_results, best_de=None):
     cols = ["Kp_Ankle", "Kd_Ankle", "Kp_Knee", "Kd_Knee", "Cost"]
+    # Prendi solo i primi 5 elementi da ogni risultato (escludi elapsed)
     data = [r[:5] for r in all_results]
-    df   = pd.DataFrame(data, columns=cols)
+    df = pd.DataFrame(data, columns=cols)
     df.sort_values('Cost', inplace=True)
     df.to_csv(SUMMARY_CSV, index=False)
     print(f"\nRisultati salvati in: {SUMMARY_CSV}")
@@ -608,9 +592,8 @@ def save_and_print_results(all_results, best_de=None):
         print(f"  Kd Knee:  {best_de['Kd_Knee']}")
         print(f"  Costo:    {best_de['Cost']:.4f}")
 
-        if best_grid['Cost'] > 0 and best_de['Cost'] < 1e8:
-            improvement = (best_grid['Cost'] - best_de['Cost']) \
-                          / best_grid['Cost'] * 100
+        if best_grid['Cost'] > 0:
+            improvement = (best_grid['Cost'] - best_de['Cost']) / best_grid['Cost'] * 100
             print(f"\n  Miglioramento rispetto al grid: {improvement:.1f}%")
 
     return best_grid.to_dict()
@@ -627,7 +610,7 @@ if __name__ == '__main__':
     os.makedirs(WORK_DIR,    exist_ok=True)
     os.makedirs(RESULTS_DIR, exist_ok=True)
     #num_cores = max(1, mp.cpu_count() // 2)
-    num_cores = 3
+    num_cores = 5
 
     print("="*60)
     print("SEA Parameter Optimization — CMC Simulation")
@@ -643,6 +626,7 @@ if __name__ == '__main__':
         print(f"  [{status}] {label}: {f}")
     print()
 
+    # Copia file di supporto e salva mapping JSON su disco
     print("Copio i file di supporto in WORK_DIR...")
     support_mapping = copy_support_files_to_workdir()
     print(f"  {len(support_mapping)} file copiati.")
@@ -680,9 +664,10 @@ if __name__ == '__main__':
 
         # ------------------------------------------------------------------
         # PHASE 2 — Differential Evolution
-        # Il mapping viene caricato da JSON dentro ogni worker (spawn Windows)
+        # support_mapping non viene passato: i worker lo caricano da JSON
         # ------------------------------------------------------------------
         best_phase2 = phase2_differential_evolution(best_phase1, num_cores)
+
 
         # ------------------------------------------------------------------
         # RISULTATI FINALI
@@ -693,10 +678,8 @@ if __name__ == '__main__':
         print("OTTIMIZZAZIONE COMPLETATA")
         print("="*60)
         print(f"\nParametri finali consigliati:")
-        print(f"  SEA_Ankle -> Kp = {best_phase2['Kp_Ankle']}  |  "
-              f"Kd = {best_phase2['Kd_Ankle']}")
-        print(f"  SEA_Knee  -> Kp = {best_phase2['Kp_Knee']}   |  "
-              f"Kd = {best_phase2['Kd_Knee']}")
+        print(f"  SEA_Ankle -> Kp = {best_phase2['Kp_Ankle']}  |  Kd = {best_phase2['Kd_Ankle']}")
+        print(f"  SEA_Knee  -> Kp = {best_phase2['Kp_Knee']}   |  Kd = {best_phase2['Kd_Knee']}")
         print(f"  Costo minimo: {best_phase2['Cost']:.4f}")
 
     except KeyboardInterrupt:

@@ -1,1 +1,1 @@
-run_dir
+3DGaitModel2392_Kinematics_q.sto
